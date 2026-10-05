@@ -10,18 +10,29 @@ print(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir,)))
 import lib.MotorModel as motor
 import lib.JoystickControl as js_ctrl
-import AutoSim
 
+# ---- Robot model: Optimal-Robotics-Lab/WaLTER_Modeling ----
+# Uses the installed package (pip install -e ../WaLTER_Modeling), or falls back to
+# a WaLTER_Modeling checkout sitting next to this repo.
+try:
+    import WaLTER_Modeling
+except ImportError:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for folder in ['WaLTER_Modeling', 'WaLTER_Modeling-main']:
+        sys.path.append(os.path.join(here, os.path.pardir, folder))
+    import WaLTER_Modeling
 
-# Call AutoSim to generate the new robot spec:
-model_config_path = 'model_configs/WS_Scale/model_config.yaml'
-motor_config_path = 'model_configs/WS_Scale/motor_config.yaml'
+FULL_SCALE = True    # False = WS (workspace scale), True = FS (full-scale robot)
+config_dir = WaLTER_Modeling.config_dir(full_scale=FULL_SCALE)
+model_config_path = config_dir / 'model_config.yaml'
+motor_config_path = config_dir / 'motor_config.yaml'
+print(f"Robot model configs: {config_dir}")
 
 # Load motor params for later access
 motor_config = yaml.safe_load(Path(motor_config_path).read_text())
 
 # Generate the new robot spec:
-walter = AutoSim.GenerateModel(model_config_path=model_config_path, motor_config_path=motor_config_path)
+walter = WaLTER_Modeling.GenerateModel(model_config_path, motor_config_path)
 
 #Add payload to walter body
 # walter.add_payload(mass = 32, body_loc = [0,0,0.2], size = [0.2, 0.1, 0.1])
@@ -31,11 +42,48 @@ walter.gen_scene()
 
 # Add some obstacles:
 
-walter.add_stairs(rise=0.2,run=0.3,num_steps=15)
-walter.add_log(d=0.4,length = 2)
-walter.add_incline(angle_deg=40, pos = [3, 5, 0], width = 1.5, length = 4 )
-walter.add_box(pos = [5.5, 5, 2.5], size = [1, 2, 0.1])
-walter.add_incline(angle_deg=-40, pos = [8, 5, 0], width = 1.5, length = 4 )
+# ---- Stair park: side-by-side staircases (up flight, landing, down flight) ----
+# Each lane starts its first riser at the same x, so you can line up by driving straight.
+# Steps are solid to the floor (no gaps underneath).
+STAIR_X0 = 1.85         # x of every lane's first riser (m)
+STAIR_WIDTH = 2.0       # lane width (m); lanes are 2.5 m apart
+STAIR_LANES = [
+    # y (m), rise (m), run (m), steps, landing (m), description,          color (RGBA)
+    (-5.0,   0.10,     0.30,    10,    1.0,         "gentle",             [0.55, 0.70, 0.55, 1]),
+    (-2.5,   0.15,     0.30,    7,     2.0,         "moderate",           [0.55, 0.65, 0.75, 1]),
+    ( 0.0,   0.20,     0.30,    6,     1.5,         "main",               [0.70, 0.70, 0.70, 1]),
+    ( 2.5,   0.20,     0.25,    6,     0.8,         "steep, short landing", [0.80, 0.65, 0.50, 1]),
+    ( 5.0,   0.25,     0.35,    5,     1.2,         "tall risers",        [0.80, 0.55, 0.55, 1]),
+    ( 7.5,   0.18,     0.40,    6,     3.0,         "shallow, long landing", [0.70, 0.60, 0.80, 1]),
+]
+
+def add_staircase(gen, tag, y, rise, run, steps, landing, rgba):
+    half_w = STAIR_WIDTH / 2
+    def box(name, x_from, x_to, top):
+        gen.spec.worldbody.add_body(name=name, pos=[(x_from + x_to) / 2, y, top / 2]).add_geom(
+            type=mujoco.mjtGeom.mjGEOM_BOX, size=[(x_to - x_from) / 2, half_w, top / 2], rgba=rgba)
+    x = STAIR_X0
+    for i in range(steps):                                   # up flight
+        box(f'{tag}_up_{i}', x, x + run, (i + 1) * rise)
+        x += run
+    box(f'{tag}_landing', x, x + landing, steps * rise)      # landing
+    x += landing
+    for j in range(steps - 1):                               # down flight to the floor
+        box(f'{tag}_down_{j}', x, x + run, (steps - 1 - j) * rise)
+        x += run
+    return x
+
+print("Stair park (first riser at x = %.2f m):" % STAIR_X0)
+for n, (y, rise, run, steps, landing, desc, rgba) in enumerate(STAIR_LANES):
+    x_end = add_staircase(walter, f'lane{n}', y, rise, run, steps, landing, rgba)
+    print(f"  y = {y:+5.1f} m: {desc:22s} rise {100*rise:4.1f} cm, run {100*run:4.1f} cm"
+          f" ({np.degrees(np.arctan2(rise, run)):4.1f} deg), {steps} steps up to {steps*rise:.2f} m,"
+          f" landing {landing:.1f} m, ends at x = {x_end:.2f} m")
+# Other obstacles, moved clear of the stair park (lanes span y = -6 to 8.5)
+walter.add_log(d=0.4, length=2, pos=[0, -8, 0.2])
+walter.add_incline(angle_deg=40, pos=[3, 12, 0], width=1.5, length=4)
+walter.add_box(pos=[5.5, 12, 2.5], size=[1, 2, 0.1])
+walter.add_incline(angle_deg=-40, pos=[8, 12, 0], width=1.5, length=4)
 # ---- Wheel visuals: tire-colored cylinders with a spin marker (physics unchanged) ----
 TIRE_RGBA   = [0.10, 0.10, 0.10, 1]   # rubber
 HUB_RGBA    = [0.60, 0.60, 0.62, 1]   # metal hub
@@ -145,16 +193,20 @@ with mujoco.viewer.launch_passive(m,d,show_left_ui=False,show_right_ui=False) as
 
         # On-screen readout of mode and body tilt, refreshed ~10x per second
         # (updating every physics step slows the sim down)
-        if controller.mode != shown_mode or time.time() - last_overlay > 0.1:
+        if controller.status != shown_mode or time.time() - last_overlay > 0.1:
             p, rt, rh = np.degrees(controller.tilt)
+            p = -p   # display pitch as + nose UP, matching L1/R1
+            pt = f"{p:+5.1f} deg"
             h = f"{100*controller.height:.1f} cm"
-            if controller.mode == "Smart Gen-0" and controller.height_target is not None:
-                h += f" (target {100*controller.height_target:.1f})"
+            if controller.mode == "Smart Gen-0":
+                pt += f" (target {np.degrees(controller.pitch_target):+.1f})"
+                if controller.height_target is not None:
+                    h += f" (target {100*controller.height_target:.1f})"
             viewer.set_texts([(mujoco.mjtFontScale.mjFONTSCALE_150,
                                mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                               "Mode\nPitch\nRoll (torso)\nRoll (head)\nRide height",
-                               f"{controller.mode}\n{p:+5.1f} deg\n{rt:+5.1f} deg\n{rh:+5.1f} deg\n{h}")])
-            shown_mode = controller.mode
+                               "Mode\nPitch (nose up +)\nRoll (torso)\nRoll (head)\nRide height",
+                               f"{controller.status}\n{pt}\n{rt:+5.1f} deg\n{rh:+5.1f} deg\n{h}")])
+            shown_mode = controller.status
             last_overlay = time.time()
 
         # Pick up changes to the physics state, apply perturbations, update options from GUI.
