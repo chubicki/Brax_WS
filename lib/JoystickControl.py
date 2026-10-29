@@ -13,8 +13,15 @@ class JoystickController:
         self.motors = motors
 
         # Initializing joystick with pygame
+        # No gamepad plugged in? Fall back to the keyboard (PS4 layout, read from the terminal)
         pygame.init()
-        self.js = pygame.joystick.Joystick(0)
+        self.use_pygame = pygame.joystick.get_count() > 0
+        if self.use_pygame:
+            self.js = pygame.joystick.Joystick(0)
+        else:
+            from lib.KeyboardJoystick import KeyboardJoystick
+            self.js = KeyboardJoystick()
+            self.controller_type = "ps4"
         self.js.init()
         print(self.js.get_name())
 
@@ -77,8 +84,8 @@ class JoystickController:
         self.climb_torque_filter = 0.05           # low-pass on hip torque before comparing (s)
         self.climb_pair_wait = 0.4                # synced: wait this long for the other end to bump (s)
         self.climb_settle_time = 0.3              # ignore stalls this soon after the wheels start (s)
-        self.climb_tumble_rate = 1.5              # bogie tumble speed (rad/s)
-        self.climb_knee_lead = 0.3                # tumble target may lead the bogie by at most this
+        self.climb_tumble_rate = 3.0              # bogie tumble speed (rad/s) (was 1.5)
+        self.climb_knee_lead = 1.0                # tumble target may lead the bogie by at most this (was 0.3; caps knee torque)
         self.climb_land_min = np.deg2rad(100)     # a bogie stopping only counts as a landing past this rotation
         self.climb_stuck_speed = np.deg2rad(5)    # bogie turning slower than this = not progressing (rad/s)
         self.climb_land_time = 0.1                # stopped this long past land_min = landed on the tread (s)
@@ -91,7 +98,7 @@ class JoystickController:
         self.climb_run_guess = 0.30               # stair run assumed until measured (m)
         self.climb_top_margin = 0.5               # roll this many runs past the expected riser = top reached
         self.climb_max_roll = np.deg2rad(20)      # stop if the body rolls more than this
-        self.climb_timeout = 12.0                 # stop if any phase takes longer than this (s)
+        self.climb_timeout = 20.0                 # stop if any phase takes longer than this (s) (was 12)
         self.wheel_leg = None                     # per-leg wheel speeds {leg: rad/s} overriding left/right
         self.climb_verbose = True                 # print phase changes and a status snapshot every 0.5 s
         self.climb_torque_frac = 0.5              # wheel torque cap while climbing, as a fraction of the slip
@@ -109,6 +116,9 @@ class JoystickController:
         self.climb_roll_torque_frac = 0.3         # fraction of the slip limit (FS: ~3.3 Nm per wheel)
         self.climb_roll_stall_speed = 0.15        # every wheel below this = robot blocked (rad/s)
         self.climb_roll_stall_time = 0.1          # ...for this long (s)
+        self.climb_noprog_dist = 0.01             # robot advancing less than this (m)...
+        self.climb_noprog_time = 0.6              # ...for this long = blocked, even if wheels slip (s)
+        self.climb_settle_hold = 0.2              # landed bogie pinned this long = tumble done (s; was 0.5)
         self.wheel_leg_torque = None              # per-leg wheel torques {leg: Nm}, overriding speed control
         self.climb_advance_margin = 0.05          # a front tumble needs the rear to have a wheelbase + this of room (m)
         # Buttons: R2 starts the ascent, L2 the descent; either trigger cancels a running one
@@ -582,6 +592,7 @@ class JoystickController:
         self.climb_dev_win = {}
         self.climb_wait = 0.0
         self.climb_blocked_t = 0.0
+        self.climb_prog_s = None
         if phase == 'SYNC':
             self.climb_moving = tuple(moving)
         if phase == 'TUMBLE':
@@ -1115,6 +1126,17 @@ class JoystickController:
             def stalled(legs):
                 return max(abs(self.climb_wheel_speed(d, leg)) for leg in legs) < self.climb_roll_stall_speed
             blocked = (stalled(self.CL_FRONT) or stalled(self.CL_REAR)) and self.climb_t > self.climb_settle_time
+            # Also blocked if the robot simply isn't advancing: wheels pushing up a riser face
+            # can slip instead of stalling (seen with the heavier hardware model)
+            s_now = float(np.mean([self.climb_lead(d, leg)[0] for leg in self.CL_LEGS]))
+            if self.climb_prog_s is None or s_now > self.climb_prog_s + self.climb_noprog_dist:
+                self.climb_prog_s, self.climb_prog_t = s_now, 0.0
+            else:
+                self.climb_prog_t += self.dt
+            if self.climb_prog_t > self.climb_noprog_time and self.climb_t > self.climb_settle_time:
+                if not blocked and self.climb_verbose and self.climb_blocked_t == 0.0:
+                    print("Climb: no forward progress (wheels slipping?) -> treating as blocked")
+                blocked = True
             self.climb_blocked_t = self.climb_blocked_t + self.dt if blocked else 0.0
             if self.climb_blocked_t >= self.climb_roll_stall_time and phase == 'APPROACH':
                 # Nothing is behind the robot yet, so the front found the first riser
@@ -1150,6 +1172,10 @@ class JoystickController:
                 elif rear_at and front_at:
                     self.climb_record_riser(d)
                     self.enter_climb('TUMBLE', self.CL_LEGS)
+                elif rear_at and all(g is not None and g < -self.climb_riser_tol for g in front_gaps):
+                    # Front is already past its last riser (on the landing): only the rear climbs
+                    print("Climb: front is on the top; rear legs climbing the last step")
+                    self.enter_climb('TUMBLE', self.CL_REAR)
                 elif rear_at:
                     self.enter_climb('SYNC', moving=self.CL_FRONT)  # front still short of its riser
                 else:
@@ -1199,7 +1225,7 @@ class JoystickController:
                     return
                 # Done when flat on the tread, or landed and the knee can't push further
                 # (ROLL keeps pulling the bogie toward flat as the robot moves on)
-                settled = self.climb_landed[leg] and self.climb_pinned_t[leg] > 0.5
+                settled = self.climb_landed[leg] and self.climb_pinned_t[leg] > self.climb_settle_hold
                 if abs(end - beta) > 0.1 and not settled:
                     done = False
             if done:
@@ -1338,7 +1364,8 @@ class JoystickController:
     
     # Get joystick state
     def get_joystick_state(self):
-        pygame.event.get()
+        if self.use_pygame:
+            pygame.event.get()
         if(self.controller_type == "logitech"):
             self.left_stick_lr = self.js.get_axis(0)
             self.left_stick_ud = self.js.get_axis(1)

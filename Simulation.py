@@ -31,14 +31,96 @@ print(f"Robot model configs: {config_dir}")
 # Load motor params for later access
 motor_config = yaml.safe_load(Path(motor_config_path).read_text())
 
-# Generate the new robot spec:
-walter = WaLTER_Modeling.GenerateModel(model_config_path, motor_config_path)
+# True = the student's realistic hardware model from WaLTER_Modeling.HardwareModel
+# False = the original robot generated from the YAML configs above
+USE_HARDWARE_MODEL = True
 
-#Add payload to walter body
-# walter.add_payload(mass = 32, body_loc = [0,0,0.2], size = [0.2, 0.1, 0.1])
+# The hardware XML uses its own names (fr_hip, fr_axle1, back_torso, ...). The controller and
+# motor setup below use the generated model's names and actuator order, so we rename to match.
+LEG_MAP = {'fr': 'head_right', 'fl': 'head_left', 'br': 'torso_right', 'bl': 'torso_left'}
 
-# Generate the scene around the robot (groundplane and sky)
-walter.gen_scene()
+ROOF_RACK = True              # the student's roof rack (HardwareModel option)
+
+def load_hardware_spec():
+    # The model generator is the up-to-date source (the checked-in XML lags behind)
+    hw = WaLTER_Modeling.HardwareModel(inertia_from_visual=True, roofrack=ROOF_RACK)
+    spec = hw.spec
+    print(f"Hardware model from HardwareModel (roof rack {'on' if ROOF_RACK else 'off'})")
+
+    bodies = {'back_torso': 'torso', 'front_torso': 'head'}
+    joints = {'root': 'torso_joint', 'waist': 'head_joint'}
+    geoms = {}
+    for p, L in LEG_MAP.items():
+        bodies.update({f'{p}_thigh': f'{L}_thigh', f'{p}_shin': f'{L}_shin',
+                       f'{p}_wheel1': f'{L}_front_wheel', f'{p}_wheel2': f'{L}_rear_wheel'})
+        joints.update({f'{p}_hip': f'{L}_thigh_joint', f'{p}_knee': f'{L}_thigh_shin_joint',
+                       f'{p}_axle1': f'{L}_shin_front_wheel_joint', f'{p}_axle2': f'{L}_shin_rear_wheel_joint'})
+        geoms.update({f'{p}_wheel1_col': f'{L}_front_wheel_geom', f'{p}_wheel2_col': f'{L}_rear_wheel_geom'})
+
+    # Joint-level torque limits from the XML (ctrlrange x gear), keyed by renamed joint
+    limits = {joints.get(a.target, a.target):
+              float(a.ctrlrange[1] * a.gear[0]) if a.ctrlrange[1] > a.ctrlrange[0] else 1e4
+              for a in spec.actuators}
+
+    for b in spec.bodies:
+        b.name = bodies.get(b.name, b.name)
+    for j in spec.joints:
+        j.name = joints.get(j.name, j.name)
+    for g in spec.geoms:
+        g.name = geoms.get(g.name, g.name)
+
+    # Check the renaming caught everything the controller needs; if not, show what's there
+    need_b = {'torso', 'head'} | {f'{L}_{w}_wheel' for L in LEG_MAP.values() for w in ('front', 'rear')}
+    need_j = {f'{L}_{j}' for L in LEG_MAP.values() for j in
+              ('thigh_joint', 'thigh_shin_joint', 'shin_front_wheel_joint', 'shin_rear_wheel_joint')}
+    have_b, have_j = {b.name for b in spec.bodies}, {j.name for j in spec.joints}
+    if not (need_b <= have_b and need_j <= have_j and len(spec.actuators) == 16):
+        print("Bodies:", sorted(have_b)); print("Joints:", sorted(have_j))
+        print("Actuators:", [(a.name, a.target) for a in spec.actuators])
+        raise RuntimeError(f"HardwareModel names changed; missing bodies {sorted(need_b - have_b)}, "
+                           f"joints {sorted(need_j - have_j)}")
+
+    # Re-target the 16 actuators into the generated model's order (bl, br, fl, fr x hip, knee,
+    # front wheel, rear wheel) so MotorModel's hard-coded indices line up. Gear 1: MotorModel
+    # commands joint torque; the XML's limits stay as joint-level ctrlrange.
+    order = []
+    for p in ['bl', 'br', 'fl', 'fr']:
+        L = LEG_MAP[p]
+        order += [(f'{p}_hip', f'{L}_thigh_joint'), (f'{p}_knee', f'{L}_thigh_shin_joint'),
+                  (f'{p}_wheel1_joint', f'{L}_shin_front_wheel_joint'),
+                  (f'{p}_wheel2_joint', f'{L}_shin_rear_wheel_joint')]
+    for a in spec.actuators:                  # temporary names avoid clashes while renaming
+        a.name = 'tmp_' + a.name
+    for a, (name, joint) in zip(spec.actuators, order):
+        a.name, a.target = name, joint
+        a.gear = [1, 0, 0, 0, 0, 0]
+        a.ctrlrange = [-limits[joint], limits[joint]]
+        a.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    print("  joint torque limits (Nm): hip %.0f, knee %.0f, wheel %.0f" % (
+        limits['torso_left_thigh_joint'], limits['torso_left_thigh_shin_joint'],
+        limits['torso_left_shin_front_wheel_joint']))
+
+    # The XML has no ground or light
+    spec.worldbody.add_geom(name='floor', type=mujoco.mjtGeom.mjGEOM_PLANE,
+                            size=[0, 0, 0.05], rgba=[0.35, 0.40, 0.45, 1])
+    spec.worldbody.add_light(name='sun', pos=[0, 0, 8], dir=[0, 0, -1])
+    return spec
+
+class HardwareModel:          # just enough of GenerateModel's interface for the stair builder
+    def __init__(self):
+        self.spec = load_hardware_spec()
+
+if USE_HARDWARE_MODEL:
+    walter = HardwareModel()
+else:
+    # Generate the new robot spec:
+    walter = WaLTER_Modeling.GenerateModel(model_config_path, motor_config_path)
+
+    #Add payload to walter body
+    # walter.add_payload(mass = 32, body_loc = [0,0,0.2], size = [0.2, 0.1, 0.1])
+
+    # Generate the scene around the robot (groundplane and sky)
+    walter.gen_scene()
 
 # Add some obstacles:
 
@@ -80,10 +162,11 @@ for n, (y, rise, run, steps, landing, desc, rgba) in enumerate(STAIR_LANES):
           f" ({np.degrees(np.arctan2(rise, run)):4.1f} deg), {steps} steps up to {steps*rise:.2f} m,"
           f" landing {landing:.1f} m, ends at x = {x_end:.2f} m")
 # Other obstacles, moved clear of the stair park (lanes span y = -6 to 8.5)
-walter.add_log(d=0.4, length=2, pos=[0, -8, 0.2])
-walter.add_incline(angle_deg=40, pos=[3, 12, 0], width=1.5, length=4)
-walter.add_box(pos=[5.5, 12, 2.5], size=[1, 2, 0.1])
-walter.add_incline(angle_deg=-40, pos=[8, 12, 0], width=1.5, length=4)
+if not USE_HARDWARE_MODEL:
+    walter.add_log(d=0.4, length=2, pos=[0, -8, 0.2])
+    walter.add_incline(angle_deg=40, pos=[3, 12, 0], width=1.5, length=4)
+    walter.add_box(pos=[5.5, 12, 2.5], size=[1, 2, 0.1])
+    walter.add_incline(angle_deg=-40, pos=[8, 12, 0], width=1.5, length=4)
 # ---- Wheel visuals: tire-colored cylinders with a spin marker (physics unchanged) ----
 TIRE_RGBA   = [0.10, 0.10, 0.10, 1]   # rubber
 HUB_RGBA    = [0.60, 0.60, 0.62, 1]   # metal hub
@@ -132,7 +215,8 @@ def add_wheel_visuals(spec, model_config):
     return collision_geoms
 
 model_config = yaml.safe_load(Path(model_config_path).read_text())
-wheel_collision_geoms = add_wheel_visuals(walter.spec, model_config)
+# The hardware model already has textured wheel meshes and hides its collision geoms
+wheel_collision_geoms = [] if USE_HARDWARE_MODEL else add_wheel_visuals(walter.spec, model_config)
 
 # Compile the model:
 m = walter.spec.compile()
@@ -149,10 +233,19 @@ fl_hip = motor.MotorModel(m, d,'head_left_thigh_joint',  motor_config['hip_param
 br_hip = motor.MotorModel(m, d,'torso_right_thigh_joint',  motor_config['hip_params'], 4)
 bl_hip = motor.MotorModel(m, d,'torso_left_thigh_joint',  motor_config['hip_params'], 0)
 
-fr_knee = motor.MotorModel(m, d, 'head_right_thigh_shin_joint', motor_config['knee_params'], 13)
-fl_knee = motor.MotorModel(m, d, 'head_left_thigh_shin_joint', motor_config['knee_params'], 9)
-br_knee = motor.MotorModel(m, d, 'torso_right_thigh_shin_joint', motor_config['knee_params'], 5)
-bl_knee = motor.MotorModel(m, d, 'torso_left_thigh_shin_joint', motor_config['knee_params'], 1)
+# Knee gains for the hardware model. The FS motor_config's Kd = 10 (x gear 120 = 1200 Nm*s/rad at the
+# joint) is unstable at a 2 ms step on the hardware knee (~0.86 kg*m^2) and makes the knees chatter.
+# 1.5 gives a damping ratio of ~2. Stays stable below ~7. The YAML itself is left untouched.
+KNEE_KD_HW = 1.5
+knee_params = dict(motor_config['knee_params'])
+if USE_HARDWARE_MODEL:
+    print(f"Knee Kd override: {knee_params['Kd']} -> {KNEE_KD_HW} (hardware model)")
+    knee_params['Kd'] = KNEE_KD_HW
+
+fr_knee = motor.MotorModel(m, d, 'head_right_thigh_shin_joint', knee_params, 13)
+fl_knee = motor.MotorModel(m, d, 'head_left_thigh_shin_joint', knee_params, 9)
+br_knee = motor.MotorModel(m, d, 'torso_right_thigh_shin_joint', knee_params, 5)
+bl_knee = motor.MotorModel(m, d, 'torso_left_thigh_shin_joint', knee_params, 1)
 
 fr_wheel1_joint = motor.MotorModel(m, d, 'head_right_shin_front_wheel_joint', motor_config['wheel_params'], 14)
 fr_wheel2_joint = motor.MotorModel(m, d, 'head_right_shin_rear_wheel_joint', motor_config['wheel_params'], 15)
@@ -171,6 +264,13 @@ motors = [fr_hip, fl_hip, br_hip, bl_hip,
 # Initialize joystick controller
 controller = js_ctrl.JoystickController("ps4", m, d, motors)
 
+# Live plot of motor torque/speed vs limits, in its own window (needs: pip install pyqtgraph)
+LIVE_PLOT = True
+if LIVE_PLOT:
+    import lib.LivePlot as live
+    publisher = live.LivePublisher(m, motors)
+    plot_proc = live.launch_plotter()
+
 # Main simulation loop:
 with mujoco.viewer.launch_passive(m,d,show_left_ui=False,show_right_ui=False) as viewer:
     start = time.time()
@@ -184,6 +284,9 @@ with mujoco.viewer.launch_passive(m,d,show_left_ui=False,show_right_ui=False) as
 
         # Call joystick controller:
         controller.control(m,d)
+
+        if LIVE_PLOT:
+            publisher.update(d, controller.status)
 
 
         # Log motor data to plot later:
@@ -221,3 +324,6 @@ with mujoco.viewer.launch_passive(m,d,show_left_ui=False,show_right_ui=False) as
 # br_wheel1_joint.plot_data_output_rpms()
 # br_knee.plot_data_output_rpms()
 # br_hip.plot_data_output_rpms()
+
+if LIVE_PLOT:
+    plot_proc.terminate()
